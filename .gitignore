@@ -1,0 +1,42 @@
+# ============================================================
+# Gitignore для клиентского репозитория dzen-factory
+# Скрывает исходную документацию, планы миграций,
+# n8n воркфлоу и личные конфигурации.
+# ============================================================
+
+# 1. Игнорировать всё по умолчанию
+*
+
+# 2. Разрешить папки
+!publisher/
+
+# 3. Разрешить файлы внутри разрешенных папок
+!publisher/**
+
+# 4. Разрешить конкретные файлы в корне
+!.gitignore
+!.env.example
+!deploy.sh
+!setup_all.sql
+!README.md
+
+# 5. Разрешить папку scripts/
+!scripts/
+!scripts/save_cookies.py
+
+# 6. Игнорировать приватные, временные и сгенерированные файлы в publisher/
+publisher/cookies/
+publisher/cookies/*
+publisher/.venv/
+publisher/.venv/*
+publisher/__pycache__/
+publisher/__pycache__/*
+publisher/*.pyc
+publisher/*.pyo
+publisher/*.pyd
+publisher/dzen.py.bak*
+publisher/main.py.bak*
+publisher/*.png
+publisher/*.jpg
+publisher/*.jpeg
+publisher/*.log

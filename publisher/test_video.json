@@ -1,0 +1,7 @@
+{
+  "article_id": "test-video-mcp-local",
+  "type": "video",
+  "title": "Тестовое видео контент-завода",
+  "body": "Описание тестового видео, загруженного локально с диска VPS.",
+  "video_url": "/opt/dzen-publisher/publisher/temp_media/test_video.mp4"
+}

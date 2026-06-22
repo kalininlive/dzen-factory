@@ -1,0 +1,6 @@
+{
+  "article_id": "test-post-mcp-local",
+  "type": "post",
+  "body": "Тестовый пост с локальной картинкой, загруженной с диска VPS.",
+  "image_urls": ["/opt/dzen-publisher/publisher/temp_media/PHOTO AVATARS/1.jpg"]
+}
