@@ -49,7 +49,6 @@ else
 fi
 
 PROJECT_DIR="/opt/dzen-publisher"
-REPO_URL="https://github.com/kalininlive/dzen-factory.git"
 
 step "[2/8] Проверка и установка системных зависимостей"
 log "Обновление списка пакетов..."
@@ -68,11 +67,19 @@ if [ -d ".git" ]; then
     git fetch origin || err "Ошибка выполнения git fetch"
     git reset --hard origin/main || err "Ошибка выполнения git reset"
 else
-    log "Клонирование репозитория: $REPO_URL"
-    cd /opt || err "Не удалось перейти в /opt"
-    rm -rf dzen-publisher
-    git clone "$REPO_URL" dzen-publisher || err "Не удалось клонировать репозиторий"
-    cd dzen-publisher || err "Не удалось перейти в директорию dzen-publisher"
+    log "Клонирование репозитория..."
+    if [ -f "./publisher/main.py" ]; then
+        log "Используются файлы из текущей директории запуска."
+    else
+        read -p "Введите URL вашего GitHub репозитория: " REPO_URL
+        if [ -z "$REPO_URL" ]; then
+            err "URL репозитория не может быть пустым."
+        fi
+        cd /opt || err "Не удалось перейти в /opt"
+        rm -rf dzen-publisher
+        git clone "$REPO_URL" dzen-publisher || err "Не удалось клонировать репозиторий"
+        cd dzen-publisher || err "Не удалось перейти в директорию dzen-publisher"
+    fi
 fi
 
 mkdir -p publisher/cookies || err "Не удалось создать директорию cookies"
@@ -121,74 +128,7 @@ EOT
     log "Сгенерирован уникальный API-ключ для n8n."
 else
     log "Файл .env уже существует. Перезапись пропущена."
-    # Пытаемся прочитать существующий ключ для вывода в конце
     GENERATED_KEY=$(grep -E '^PUBLISHER_API_KEY=' .env | cut -d= -f2 || echo "Секретный_ключ_из_.env")
-fi
-
-log "Настройка подключения к PostgreSQL (DATABASE_URL)..."
-if grep -qE '^DATABASE_URL=' .env 2>/dev/null; then
-    log "DATABASE_URL уже задан в .env. Пропуск настройки."
-else
-    DATABASE_URL_VALUE=""
-    SUPABASE_DB_PASS=""
-
-    if command -v docker &>/dev/null; then
-        for CONTAINER in supabase-db supabase_db postgres db; do
-            PASS=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER" 2>/dev/null \
-                | grep -E '^POSTGRES_PASSWORD=' | cut -d= -f2 | tr -d '[:space:]' | head -1)
-            if [ -n "$PASS" ]; then
-                SUPABASE_DB_PASS="$PASS"
-                log "Найден пароль Postgres в Docker-контейнере '$CONTAINER'"
-                break
-            fi
-        done
-    fi
-
-    if [ -z "$SUPABASE_DB_PASS" ]; then
-        for SB_ENV_FILE in /opt/supabase/.env /opt/supabase/docker/.env ~/supabase/.env ~/supabase/docker/.env; do
-            if [ -f "$SB_ENV_FILE" ]; then
-                PASS=$(grep -E '^POSTGRES_PASSWORD=' "$SB_ENV_FILE" | cut -d= -f2 | tr -d '[:space:]' | head -1)
-                if [ -n "$PASS" ]; then
-                    SUPABASE_DB_PASS="$PASS"
-                    log "Найден пароль Postgres в $SB_ENV_FILE"
-                    break
-                fi
-            fi
-        done
-    fi
-
-    if [ -n "$SUPABASE_DB_PASS" ]; then
-        for PG_HOST in localhost 127.0.0.1 db; do
-            if python3 -c "
-import socket
-try:
-    s = socket.create_connection(('$PG_HOST', 5432), timeout=2)
-    s.close()
-    exit(0)
-except:
-    exit(1)
-" 2>/dev/null; then
-                DATABASE_URL_VALUE="postgresql://postgres:${SUPABASE_DB_PASS}@${PG_HOST}:5432/postgres"
-                log "PostgreSQL доступен на ${PG_HOST}:5432"
-                break
-            fi
-        done
-    fi
-
-    if [ -z "$DATABASE_URL_VALUE" ]; then
-        warn "Не удалось автоматически определить DATABASE_URL."
-        echo -e "${YELLOW}Введите DATABASE_URL вручную (оставьте пустым чтобы пропустить):${NC}"
-        echo -e "  Пример self-hosted: postgresql://postgres:password@localhost:5432/postgres"
-        echo -e "  Пример supabase.co:  postgresql://postgres.xxx:pass@aws-region.pooler.supabase.com:6543/postgres"
-        read -p "DATABASE_URL: " DATABASE_URL_VALUE
-    fi
-
-    if [ -n "$DATABASE_URL_VALUE" ]; then
-        echo "DATABASE_URL=$DATABASE_URL_VALUE" >> .env
-        log "DATABASE_URL записан в .env"
-    else
-        warn "DATABASE_URL не задан. Сервис будет использовать in-memory счётчик."
-    fi
 fi
 
 step "[7/8] Настройка systemd"
@@ -238,5 +178,5 @@ echo -e -n "${YELLOW}HTTP Header Auth Name: ${BOLD}X-API-Key${NC}\n"
 echo -e -n "${YELLOW}HTTP Header Auth Value (Скопируйте это): ${RED}${BOLD}$GENERATED_KEY${NC}\n"
 echo -e "${BLUE}${BOLD}============================================================${NC}"
 echo -e "${GREEN}Локальный порт сервиса: http://localhost:8001/health${NC}"
-echo -e "${GREEN}Инструкции по обновлению cookies и запуску читайте в README.md${NC}"
+echo -e "${GREEN}Инструкции по обновлению cookies и запуску читайте в AGENTS.md${NC}"
 echo -e "${BLUE}${BOLD}============================================================${NC}"
