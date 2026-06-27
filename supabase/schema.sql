@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS dzen.accounts (
                     CHECK (platform IN ('dzen', 'wordpress', 'telegram', 'vc', 'medium')),
     label           text NOT NULL,                    -- произвольное имя аккаунта
     channel_url     text,                             -- URL канала/сайта
+    email           text,                             -- почта аккаунта
     cookie_file     text,                             -- путь к файлу cookies на VPS
     proxy_url       text,                             -- прокси для этого аккаунта
 
