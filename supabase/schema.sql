@@ -260,3 +260,4 @@ COMMENT ON VIEW dzen.ready_to_publish IS
 INSERT INTO dzen.accounts (platform, label, channel_url, cookie_file, daily_limit, is_active)
 VALUES ('dzen', 'Основной аккаунт', 'https://dzen.ru/', './cookies/dzen_cookies.json', 3, false)
 ON CONFLICT DO NOTHING;
+
