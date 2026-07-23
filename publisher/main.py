@@ -27,13 +27,14 @@ from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, field_validator
 
 import config
+from content_limits import normalize_content, ContentValidationError
 from cookies import cookies_exist
 from dzen import DzenPublisher
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ── DB Pool ───────────────────────────────────────────────────────────────────
+# ── DB Pool ────────────────────────────────────────────────────
 
 _db_pool: Optional[asyncpg.Pool] = None
 
@@ -77,7 +78,7 @@ def _increment_count_memory() -> None:
     _daily["count"] += 1
 
 
-# ── DB-backed counter (primary, per account_id) ───────────────────────────────
+# ── DB-backed counter (primary, per account_id) ──────────────────────────
 
 async def _get_account_limit_db(pool: asyncpg.Pool, account_id: str) -> Optional[dict]:
     """
@@ -141,7 +142,7 @@ async def _increment_count_db(pool: asyncpg.Pool, account_id: str) -> None:
         log.warning("Не удалось инкрементировать today_count для %s: %s", account_id, e)
 
 
-# ── Auth ──────────────────────────────────────────────────────────────────────
+# ── Auth ──────────────────────────────────────────────────────
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
 
@@ -155,12 +156,12 @@ def verify_api_key(key: str = Security(api_key_header)) -> str:
     return key
 
 
-# ── Models ────────────────────────────────────────────────────────────────────
+# ── Models ────────────────────────────────────────────────────
 
 class PublishRequest(BaseModel):
     article_id: str
     account_id: Optional[str] = None
-    type: str = "article"  # "article", "post", "video"
+    type: str = "article"  # "article" | "post" | "video" | "reel"
     title: Optional[str] = None
     body: str
     image_urls: list[str] = []
@@ -220,7 +221,7 @@ class HealthResponse(BaseModel):
     limit_source: str  # "database" или "memory"
 
 
-# ── App ───────────────────────────────────────────────────────────────────────
+# ── App ─────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -251,7 +252,7 @@ app = FastAPI(title="Dzen Publisher Service", lifespan=lifespan)
 async def publish(req: PublishRequest, _key: str = Security(verify_api_key)):
     pool = await _get_pool()
 
-    # ── Проверка дневного лимита ────────────────────────────────────────────
+    # ── Проверка дневного лимита ───────────────────────────────────
     limit_from_db = False
     today_count = 0
     daily_limit = config.MAX_DAILY_PUBLICATIONS
@@ -282,7 +283,29 @@ async def publish(req: PublishRequest, _key: str = Security(verify_api_key)):
             cookies_valid=True,
         )
 
-    # ── Проверка cookies ────────────────────────────────────────────────────
+    # ── Нормализация под лимиты типа (жёстко, на сервере) ───────────────────────
+    # video: title ≤140, desc ≤5000, обложка обязательна.
+    # reel:  без заголовка, desc ≤200, обложка не нужна.
+    # Гарантия лимитов НЕ зависит от LLM/n8n — режем здесь.
+    try:
+        norm = normalize_content(req.type, req.title, req.body, req.cover_url)
+    except ContentValidationError as e:
+        log.warning("Валидация контента не пройдена [%s]: %s", req.article_id, e)
+        return PublishResponse(
+            success=False,
+            article_id=req.article_id,
+            error="validation_error",
+            message=str(e),
+            cookies_valid=True,
+        )
+    req.title = norm["title"]
+    req.body = norm["body"]
+    log.info(
+        "Нормализация [%s]: тип=%s заголовок=%s симв. описание=%s симв.",
+        req.article_id, req.type, norm["meta"]["title_len"], norm["meta"]["body_len"],
+    )
+
+    # ── Проверка cookies ────────────────────────────────────────────
     cookies_dir = os.path.dirname(config.DZEN_COOKIES_PATH)
     cookies_path = (
         os.path.join(cookies_dir, f"{req.account_id}.json")
@@ -307,7 +330,7 @@ async def publish(req: PublishRequest, _key: str = Security(verify_api_key)):
         (req.title or req.body)[:60],
     )
 
-    # ── Публикация ──────────────────────────────────────────────────────────
+    # ── Публикация ──────────────────────────────────────────────
     async with DzenPublisher(account_id=req.account_id) as publisher:
         result = await publisher.publish(
             content_type=req.type,
@@ -469,7 +492,7 @@ async def health():
     )
 
 
-# ── Telegram notifications ────────────────────────────────────────────────────
+# ── Telegram notifications ─────────────────────────────────────────
 
 async def _maybe_notify_telegram(error_code: str, message: str, draft_url: Optional[str] = None) -> None:
     if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
@@ -493,7 +516,7 @@ async def _maybe_notify_telegram(error_code: str, message: str, draft_url: Optio
         log.warning("Не удалось отправить Telegram-уведомление: %s", e)
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
