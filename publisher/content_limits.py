@@ -12,7 +12,8 @@
   video   — обычное (горизонтальное) видео: заголовок ≤140, описание ≤5000,
             обложка ОБЯЗАТЕЛЬНА, поддерживаются теги.
   reel    — ролик (вертикальное короткое видео): БЕЗ заголовка,
-            описание ≤200, обложка не нужна.
+            описание ≤200, обложка опциональна (если нет — кадр из ролика),
+            теги поддерживаются.
 """
 
 from typing import Optional
@@ -27,7 +28,7 @@ CONTENT_LIMITS: dict[str, dict] = {
     "article": {"title": 100,  "desc": 100_000, "cover": False, "tags": True},
     "post":    {"title": None, "desc": 4_000,   "cover": False, "tags": False},
     "video":   {"title": 140,  "desc": 5_000,   "cover": True,  "tags": True},
-    "reel":    {"title": None, "desc": 200,     "cover": False, "tags": False},
+    "reel":    {"title": None, "desc": 200,     "cover": False, "tags": True},
 }
 
 DEFAULT_TYPE = "article"

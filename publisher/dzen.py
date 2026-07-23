@@ -162,6 +162,7 @@ class DzenPublisher:
         image_urls: list[str] | None = None,
         video_url: Optional[str] = None,
         cover_url: Optional[str] = None,
+        tags: list[str] | None = None,
     ) -> dict:
         cookies = load_cookies(self._get_cookies_path())
         if not cookies:
@@ -173,10 +174,12 @@ class DzenPublisher:
             if content_type == "post":
                 return await self._do_publish_post(page, body or "", image_urls or [])
             elif content_type == "reel":
-                return await self._do_publish_reel(page, video_url or "", body or "")
+                return await self._do_publish_reel(
+                    page, video_url or "", body or "", cover_url, tags or []
+                )
             elif content_type == "video":
                 return await self._do_publish_video(
-                    page, video_url or "", title or "Без названия", body or "", cover_url
+                    page, video_url or "", title or "Без названия", body or "", cover_url, tags or []
                 )
             else:
                 return await self._do_publish(page, title or "Без названия", body or "", image_urls or [])
@@ -1004,8 +1007,108 @@ class DzenPublisher:
         log.info("Пост опубликован. URL: %s", published_url)
         return {"success": True, "published_url": published_url}
 
+    async def _set_video_tags(self, page: Page, tags: list[str]) -> None:
+        """Best-effort проставление тегов в модалке публикации видео/ролика.
+
+        Дзен показывает поле «Теги» (input), куда каждый тег вводится + Enter.
+        Никогда не роняет публикацию: при неудаче просто логирует и снимает скрин.
+        """
+        if not tags:
+            return
+        try:
+            tag_input = None
+            for sel in [
+                '[role="dialog"] input[placeholder*="ег"]',
+                '[role="dialog"] input[placeholder*="Тег"]',
+                'input[placeholder*="Добавьте тег"]',
+                'input[placeholder*="добавьте тег"]',
+                'input[placeholder*="Теги"]',
+                'input[placeholder*="теги"]',
+                'input[placeholder*="ештег"]',
+                '[data-testid*="tag"] input',
+                'input[name*="tag"]',
+            ]:
+                loc = page.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    tag_input = loc
+                    break
+            if not tag_input:
+                log.warning("Поле тегов не найдено — теги пропущены: %s", ", ".join(tags))
+                await _screenshot(page, "debug_tags_input_not_found.png")
+                return
+            for tag in tags[:10]:
+                clean = tag.strip().lstrip("#")
+                if not clean:
+                    continue
+                await tag_input.click()
+                await tag_input.type(clean, delay=30)
+                await asyncio.sleep(0.3)
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(0.4)
+            log.info("Теги проставлены (%d): %s", len(tags), ", ".join(tags))
+        except Exception as e:
+            log.warning("Не удалось проставить теги: %s", e)
+
+    async def _ensure_public_visibility(self, page: Page) -> None:
+        """Best-effort: выбирает доступ «Все» / «Доступно всем», если в модалке
+        есть переключатель аудитории. При отсутствии — молча выходит.
+        """
+        try:
+            clicked = await page.evaluate(
+                """() => {
+                    const wanted = ['Все', 'Всем', 'Доступно всем', 'Публичный', 'Для всех', 'Всем в Дзене'];
+                    const els = Array.from(document.querySelectorAll(
+                        '[role="dialog"] *, [role="radio"], label, button, span, div'
+                    ));
+                    for (const el of els) {
+                        const t = (el.innerText || '').trim();
+                        if (wanted.includes(t)) { el.click(); return t; }
+                    }
+                    return null;
+                }"""
+            )
+            if clicked:
+                log.info("Доступ к публикации установлен: %s", clicked)
+                await asyncio.sleep(0.5)
+        except Exception as e:
+            log.warning("Не удалось установить публичный доступ: %s", e)
+
+    async def _upload_cover_into_modal(self, page: Page, cover_url: Optional[str]) -> Optional[str]:
+        """Скачивает и загружает обложку в модалку публикации (best-effort).
+
+        Возвращает путь к временному файлу (для последующей очистки) или None.
+        Если cover_url не задан или недоступен — Дзен берёт кадр из ролика/видео.
+        """
+        if not cover_url:
+            return None
+        temp_cover_path = None
+        cover_file = None
+        if cover_url.startswith(("http://", "https://")):
+            temp_cover_path = await self._download_to_temp_file(cover_url, "cover")
+            cover_file = temp_cover_path
+        elif os.path.exists(cover_url):
+            cover_file = cover_url
+        if not cover_file:
+            log.warning("Обложка недоступна (%s) — используем кадр по умолчанию", cover_url)
+            return None
+        try:
+            file_inputs = page.locator('input[type="file"]')
+            cnt = await file_inputs.count()
+            # Первый input, как правило, видео; обложка — следующий.
+            cover_input = file_inputs.nth(1) if cnt > 1 else (file_inputs.first if cnt == 1 else None)
+            if cover_input:
+                log.info("Загружаем обложку...")
+                await cover_input.set_input_files(cover_file)
+                await asyncio.sleep(3)
+            else:
+                log.warning("Инпут обложки не найден в модалке")
+        except Exception as e:
+            log.warning("Не удалось загрузить обложку: %s", e)
+        return temp_cover_path
+
     async def _do_publish_video(
-        self, page: Page, video_url: str, title: str, description: str, cover_url: Optional[str] = None
+        self, page: Page, video_url: str, title: str, description: str,
+        cover_url: Optional[str] = None, tags: list[str] | None = None,
     ) -> dict:
         log.info("Переход в Студию для публикации видео: %s", ENTRY_URL)
         await page.goto(ENTRY_URL, wait_until="domcontentloaded", timeout=60_000)
@@ -1153,6 +1256,10 @@ class DzenPublisher:
                 else:
                     log.warning("Инпут для загрузки обложки не найден")
 
+            # Теги + публичный доступ (best-effort)
+            await self._set_video_tags(page, tags or [])
+            await self._ensure_public_visibility(page)
+
             # Ожидание окончания загрузки
             log.info("Ожидаем завершения загрузки видео на server (до 180с)...")
             
@@ -1250,13 +1357,16 @@ class DzenPublisher:
                     pass
 
     async def _do_publish_reel(
-        self, page: Page, video_url: str, description: str
+        self, page: Page, video_url: str, description: str,
+        cover_url: Optional[str] = None, tags: list[str] | None = None,
     ) -> dict:
         """Публикация РОЛИКА (вертикальное короткое видео).
 
         Отличия от обычного видео:
           - нет отдельного заголовка (описание = «шапка», ≤200 символов);
-          - обложка не нужна (берётся кадр из ролика);
+          - обложка опциональна: если передан cover_url — грузим её,
+            иначе Дзен берёт кадр из ролика;
+          - теги проставляются best-effort, если поле есть в модалке;
           - отдельный пункт меню «Ролик» / «Загрузить ролик».
 
         ВНИМАНИЕ: селекторы пункта меню и поля описания ролика
@@ -1303,6 +1413,7 @@ class DzenPublisher:
 
         # Готовим файл ролика
         temp_video_path = None
+        temp_cover_path = None
         if video_url.startswith(("http://", "https://")):
             temp_video_path = await self._download_to_temp_file(video_url, "reel", extension=".mp4")
             if not temp_video_path:
@@ -1390,6 +1501,16 @@ class DzenPublisher:
             else:
                 log.warning("Поле описания ролика не найдено")
 
+            # Обложка (если передана) — иначе Дзен возьмёт кадр из ролика
+            temp_cover_path = await self._upload_cover_into_modal(page, cover_url)
+
+            # Теги (best-effort) + публичный доступ «Все»
+            await self._set_video_tags(page, tags or [])
+            await self._ensure_public_visibility(page)
+
+            # Диагностический снимок модалки перед публикацией — для сверки селекторов
+            await _screenshot(page, "debug_reel_modal_before_publish.png")
+
             # Ждём завершения загрузки + жмём публикацию
             log.info("Ожидаем завершения загрузки ролика (до 180с)...")
             intercepted_urls: list[str] = []
@@ -1451,14 +1572,39 @@ class DzenPublisher:
                 await _screenshot(page, "captcha_detected.png")
                 raise CaptchaDetectedError("SmartCaptcha обнаружена при публикации ролика")
 
-            published_url = intercepted_urls[-1] if intercepted_urls else page.url
-            log.info("Ролик успешно опубликован. URL: %s", published_url)
+            await _screenshot(page, "debug_reel_after_publish.png")
+
+            # Ролик обрабатывается асинхронно — публичный URL приходит не сразу.
+            # Поллим перехваченные ответы до 30с в поисках публичной ссылки.
+            published_url = None
+            for _ in range(15):
+                if intercepted_urls:
+                    published_url = intercepted_urls[-1]
+                    break
+                await asyncio.sleep(2)
+
+            if not published_url:
+                # Публичной ссылки пока нет (видео ещё обрабатывается).
+                # Возвращаем studio-ссылку как страховку, но помечаем в логе.
+                published_url = page.url
+                log.warning(
+                    "Публичный URL ролика не получен (ролик обрабатывается). "
+                    "Studio-ссылка: %s", published_url,
+                )
+            else:
+                log.info("Ролик успешно опубликован. Публичный URL: %s", published_url)
+
             return {"success": True, "published_url": published_url}
 
         finally:
             if temp_video_path and os.path.exists(temp_video_path):
                 try:
                     os.remove(temp_video_path)
+                except Exception:
+                    pass
+            if temp_cover_path and os.path.exists(temp_cover_path):
+                try:
+                    os.remove(temp_cover_path)
                 except Exception:
                     pass
 

@@ -167,6 +167,7 @@ class PublishRequest(BaseModel):
     image_urls: list[str] = []
     video_url: Optional[str] = None
     cover_url: Optional[str] = None
+    tags: list[str] = []
     scheduled_at: Optional[str] = None
 
     @field_validator("image_urls", mode="before")
@@ -187,6 +188,29 @@ class PublishRequest(BaseModel):
                 except Exception:
                     pass
             return [s]
+        return []
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def coerce_tags(cls, v):
+        """Принимает массив, JSON-строку или строку с тегами через запятую."""
+        import json as _json
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return [str(t).strip().lstrip("#") for t in v if str(t).strip()]
+        if isinstance(v, str):
+            s = v.strip()
+            if not s or s == "null":
+                return []
+            if s.startswith("["):
+                try:
+                    arr = _json.loads(s)
+                    return [str(t).strip().lstrip("#") for t in arr if str(t).strip()]
+                except Exception:
+                    pass
+            # строка вида "тег1, тег2, тег3"
+            return [t.strip().lstrip("#") for t in s.split(",") if t.strip()]
         return []
 
 
@@ -339,6 +363,7 @@ async def publish(req: PublishRequest, _key: str = Security(verify_api_key)):
             image_urls=req.image_urls,
             video_url=req.video_url,
             cover_url=req.cover_url,
+            tags=req.tags,
         )
 
     if result["success"]:
