@@ -1542,6 +1542,54 @@ class DzenPublisher:
                     break
                 await asyncio.sleep(5)
 
+            # Ссылка на ролик («Ссылка на видео») живёт ВНУТРИ модалки и пропадает
+            # после клика «Опубликовать» (страница уходит на список публикаций).
+            # Поэтому забираем публичный URL СЕЙЧАС, пока модалка открыта.
+            reel_link = None
+            for _ in range(10):
+                # 1) явный <a href> на видео
+                try:
+                    href = await page.evaluate(
+                        """() => {
+                            const a = document.querySelector('a[href*="/video/watch/"], a[href*="/shorts/"]');
+                            if (a && a.href) return a.href;
+                            const html = document.documentElement.outerHTML;
+                            const m = html.match(/dzen\\.ru\\/(?:video\\/watch|shorts)\\/[A-Za-z0-9_-]+/);
+                            return m ? 'https://' + m[0] : null;
+                        }"""
+                    )
+                except Exception:
+                    href = None
+                if href:
+                    reel_link = href
+                    break
+                # 2) кнопка «Скопировать» → буфер обмена
+                try:
+                    copied = await page.evaluate(
+                        """() => {
+                            const b = Array.from(document.querySelectorAll('button'))
+                                .find(x => (x.innerText || '').trim() === 'Скопировать');
+                            if (b) { b.click(); return true; }
+                            return false;
+                        }"""
+                    )
+                    if copied:
+                        await asyncio.sleep(0.4)
+                        clip = await page.evaluate(
+                            "async () => { try { return await navigator.clipboard.readText(); } catch(e) { return null; } }"
+                        )
+                        if clip and re.search(r"dzen\.ru/(?:video/watch|shorts)/[A-Za-z0-9_-]+", clip):
+                            reel_link = clip.strip()
+                            break
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+            if reel_link:
+                log.info("Ссылка на ролик получена из модалки (до публикации): %s", reel_link)
+            else:
+                log.warning("Ссылка на ролик в модалке не найдена до публикации")
+                await _screenshot(page, "debug_reel_link_not_found.png")
+
             # Публикация ролика — кнопка «Опубликовать после обработки» (пока видео
             # обрабатывается) или «Опубликовать» (когда обработано).
             # НЕ используем «Сохранить изменения» — она сохраняет правку поверх уже
@@ -1606,8 +1654,10 @@ class DzenPublisher:
             # Публичная ссылка ролика имеет вид https://dzen.ru/video/watch/<id>.
             # После публикации она появляется прямо в модалке (блок «Ссылка на видео»)
             # — читаем из DOM; параллельно держим перехваченные из сети как fallback.
-            published_url = None
+            published_url = reel_link
             for _ in range(20):
+                if published_url:
+                    break
                 # 1) Кнопка «Скопировать» рядом с «Ссылка на видео» → читаем полный URL из буфера
                 try:
                     copied = await page.evaluate(
