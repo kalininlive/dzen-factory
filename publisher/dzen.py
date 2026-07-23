@@ -24,11 +24,11 @@ from config import (
 
 log = logging.getLogger(__name__)
 
-# ── Verified URLs ─────────────────────────────────────────────────
+# ── Verified URLs ─────────────────────────────────────────────────────────────
 ENTRY_URL = "https://dzen.ru/profile/editor/create"
 PROFILE_API = "https://dzen.ru/api/v3/launcher/export"
 
-# ── Verified selectors (2026-05-30) ──────────────────────────────────
+# ── Verified selectors (2026-05-30) ──────────────────────────────────────────
 ADD_BUTTON = '[data-testid="add-publication-button"]'
 WRITE_ARTICLE_TEXT = "Написать статью"
 TEXTBOX_SELECTOR = '[role="textbox"]'
@@ -48,7 +48,7 @@ USER_AGENT = (
 )
 
 
-# ── Exceptions ──────────────────────────────────────────────────────
+# ── Exceptions ────────────────────────────────────────────────────────────────
 
 class SessionExpiredError(Exception):
     pass
@@ -77,7 +77,7 @@ async def _is_login_page(page: Page) -> bool:
     return False
 
 
-# ── Publisher ───────────────────────────────────────────────────────
+# ── Publisher ─────────────────────────────────────────────────────────────────
 
 class DzenPublisher:
     def __init__(self, account_id: Optional[str] = None):
@@ -110,7 +110,7 @@ class DzenPublisher:
             return os.path.join(base_dir, f"{self.account_id}.json")
         return DZEN_COOKIES_PATH
 
-    # ── Public ────────────────────────────────────────────────────────
+    # ── Public ────────────────────────────────────────────────────────────────
 
     async def check_session(self) -> bool:
         cookies = load_cookies(self._get_cookies_path())
@@ -196,7 +196,7 @@ class DzenPublisher:
             await ctx.close()
 
 
-    # ── Internal ──────────────────────────────────────────────────────
+    # ── Internal ──────────────────────────────────────────────────────────────
 
     async def _make_context(self, cookies: list) -> BrowserContext:
         proxy = None
@@ -525,13 +525,13 @@ class DzenPublisher:
                 f"Найдено {count} полей ввода, ожидалось 2. URL: {page.url}"
             )
 
-        # ── Заголовок ─────────────────────────────────────────────────────
+        # ── Заголовок ─────────────────────────────────────────────────────────
         log.info("Заголовок: %s", title[:60])
         await textboxes.first.click(force=True)
         await self._paste_text(page, title)
         await asyncio.sleep(0.5)
 
-        # ── Активируем поле тела ──────────────────────────────────────────
+        # ── Активируем поле тела ──────────────────────────────────────────────
         await textboxes.nth(1).click(force=True)
         await asyncio.sleep(1)
 
@@ -1280,15 +1280,18 @@ class DzenPublisher:
         )
         await asyncio.sleep(2)
 
-        log.info("Выбираем пункт меню 'Ролик'...")
+        # ВАЖНО: отдельного пункта «Ролик» в меню НЕТ. Загрузка идёт через общий
+        # «Загрузить видео», а Дзен сам определяет ролик по вертикальному
+        # соотношению сторон/длительности и показывает модалку «Публикация ролика».
+        log.info("Выбираем пункт меню 'Загрузить видео' (тип определит Дзен по файлу)...")
         await page.evaluate(
             """() => {
                 const all = document.querySelectorAll('span, button, li, [role="menuitem"]');
                 for (const el of all) {
                     const txt = el.innerText ? el.innerText.trim() : "";
-                    if (txt === 'Загрузить ролик' || txt === 'Ролик'
-                        || txt === 'Загрузить видеоролик' || txt === 'Снять ролик'
-                        || txt === 'Добавить ролик') {
+                    if (txt === 'Загрузить видео' || txt === 'Загрузить ролик'
+                        || txt === 'Видео' || txt === 'Ролик'
+                        || txt === 'Загрузить видеоролик') {
                         el.click();
                         return;
                     }
@@ -1328,16 +1331,46 @@ class DzenPublisher:
             log.info("Загружаем файл ролика через set_input_files...")
             await file_input.set_input_files(video_file)
 
-            # Поле описания (заголовка у ролика нет)
-            log.info("Ожидаем форму описания ролика (до 30с)...")
+            # Ждём модалку «Публикация ролика» (появляется после определения
+            # вертикального формата). Если вместо неё открылась форма обычного
+            # видео — логируем: файл не распознан как ролик.
+            log.info("Ожидаем модалку 'Публикация ролика' (до 60с)...")
+            dialog_kind = None
+            for attempt in range(60):
+                dialog_kind = await page.evaluate(
+                    """() => {
+                        const txt = document.body.innerText || '';
+                        if (txt.includes('Публикация ролика')) return 'reel';
+                        if (txt.includes('Публикация видео')) return 'video';
+                        return null;
+                    }"""
+                )
+                if dialog_kind:
+                    log.info("Модалка публикации появилась через %dс (тип: %s)", attempt, dialog_kind)
+                    break
+                await asyncio.sleep(1)
+
+            if dialog_kind == "video":
+                log.warning(
+                    "Дзен распознал файл как ОБЫЧНОЕ видео, а не ролик. "
+                    "Проверьте соотношение сторон (нужно вертикальное 9:16) и длительность."
+                )
+            elif dialog_kind is None:
+                log.warning("Модалка публикации не появилась за 60с — продолжаем по селекторам")
+
+            # Поле описания (заголовка у ролика нет). В модалке ролика это
+            # textarea/contenteditable со счётчиком N/200, предзаполненное
+            # именем файла — очищаем перед вставкой.
             desc_input = None
-            for attempt in range(30):
+            for attempt in range(15):
                 for sel in [
+                    '[role="dialog"] textarea',
+                    '[role="dialog"] [contenteditable="true"]',
+                    'textarea[placeholder*="писани"]',
+                    'textarea[placeholder*="Опишите"]',
                     '.ql-editor',
                     '[contenteditable="true"]',
-                    'textarea[placeholder*="писани"]',
-                    'textarea[placeholder*="Добавьте описание"]',
-                    'textarea[placeholder*="Опишите"]',
+                    'textarea',
                     '[role="textbox"]',
                 ]:
                     loc = page.locator(sel).first
@@ -1345,7 +1378,6 @@ class DzenPublisher:
                         desc_input = loc
                         break
                 if desc_input:
-                    log.info("Форма описания ролика появилась через %dс", attempt)
                     break
                 await asyncio.sleep(1)
 
@@ -1366,7 +1398,7 @@ class DzenPublisher:
                 try:
                     if response.status == 200 and "application/json" in response.headers.get("content-type", ""):
                         t = await response.text()
-                        m = re.findall(r"https://dzen\.ru/[abv]/[A-Za-z0-9_-]+", t)
+                        m = re.findall(r"https://dzen\.ru/(?:shorts|[abv])/[A-Za-z0-9_-]+", t)
                         if m:
                             intercepted_urls.extend(m)
                 except Exception:
@@ -1374,9 +1406,12 @@ class DzenPublisher:
 
             page.on("response", _on_response)
 
+            # Кнопка в модалке ролика называется «Опубликовать после обработки» —
+            # активна уже во время обработки видео, публикация произойдёт сама.
             publish_btn = None
             for attempt in range(36):
                 for sel in [
+                    'button:has-text("Опубликовать после обработки")',
                     '[data-testid="video-publish-btn"]',
                     '[data-testid="publish-btn"]',
                     'button:has-text("Опубликовать")',
@@ -1429,7 +1464,7 @@ class DzenPublisher:
 
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _err(code: str, message: str, draft_url: Optional[str] = None) -> dict:
     result: dict = {"success": False, "error": code, "message": message}
