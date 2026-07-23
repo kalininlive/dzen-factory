@@ -1519,7 +1519,7 @@ class DzenPublisher:
                 try:
                     if response.status == 200 and "application/json" in response.headers.get("content-type", ""):
                         t = await response.text()
-                        m = re.findall(r"https://dzen\.ru/(?:shorts|[abv])/[A-Za-z0-9_-]+", t)
+                        m = re.findall(r"https://dzen\.ru/(?:video/watch|shorts|[abv])/[A-Za-z0-9_-]+", t)
                         if m:
                             intercepted_urls.extend(m)
                 except Exception:
@@ -1574,10 +1574,26 @@ class DzenPublisher:
 
             await _screenshot(page, "debug_reel_after_publish.png")
 
-            # Ролик обрабатывается асинхронно — публичный URL приходит не сразу.
-            # Поллим перехваченные ответы до 30с в поисках публичной ссылки.
+            # Публичная ссылка ролика имеет вид https://dzen.ru/video/watch/<id>.
+            # После публикации она появляется прямо в модалке (блок «Ссылка на видео»)
+            # — читаем из DOM; параллельно держим перехваченные из сети как fallback.
             published_url = None
-            for _ in range(15):
+            for _ in range(20):
+                try:
+                    href = await page.evaluate(
+                        """() => {
+                            const a = document.querySelector(
+                                'a[href*="dzen.ru/video/watch"], a[href*="/video/watch/"], '
+                                + 'a[href*="dzen.ru/shorts/"], a[href*="/shorts/"]'
+                            );
+                            return a ? a.href : null;
+                        }"""
+                    )
+                except Exception:
+                    href = None
+                if href:
+                    published_url = href
+                    break
                 if intercepted_urls:
                     published_url = intercepted_urls[-1]
                     break
