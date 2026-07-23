@@ -24,11 +24,11 @@ from config import (
 
 log = logging.getLogger(__name__)
 
-# ── Verified URLs ─────────────────────────────────────────────────────────────
+# ── Verified URLs ─────────────────────────────────────────────────
 ENTRY_URL = "https://dzen.ru/profile/editor/create"
 PROFILE_API = "https://dzen.ru/api/v3/launcher/export"
 
-# ── Verified selectors (2026-05-30) ──────────────────────────────────────────
+# ── Verified selectors (2026-05-30) ──────────────────────────────────
 ADD_BUTTON = '[data-testid="add-publication-button"]'
 WRITE_ARTICLE_TEXT = "Написать статью"
 TEXTBOX_SELECTOR = '[role="textbox"]'
@@ -48,7 +48,7 @@ USER_AGENT = (
 )
 
 
-# ── Exceptions ────────────────────────────────────────────────────────────────
+# ── Exceptions ──────────────────────────────────────────────────────
 
 class SessionExpiredError(Exception):
     pass
@@ -77,7 +77,7 @@ async def _is_login_page(page: Page) -> bool:
     return False
 
 
-# ── Publisher ─────────────────────────────────────────────────────────────────
+# ── Publisher ───────────────────────────────────────────────────────
 
 class DzenPublisher:
     def __init__(self, account_id: Optional[str] = None):
@@ -110,7 +110,7 @@ class DzenPublisher:
             return os.path.join(base_dir, f"{self.account_id}.json")
         return DZEN_COOKIES_PATH
 
-    # ── Public ────────────────────────────────────────────────────────────────
+    # ── Public ────────────────────────────────────────────────────────
 
     async def check_session(self) -> bool:
         cookies = load_cookies(self._get_cookies_path())
@@ -172,6 +172,8 @@ class DzenPublisher:
         try:
             if content_type == "post":
                 return await self._do_publish_post(page, body or "", image_urls or [])
+            elif content_type == "reel":
+                return await self._do_publish_reel(page, video_url or "", body or "")
             elif content_type == "video":
                 return await self._do_publish_video(
                     page, video_url or "", title or "Без названия", body or "", cover_url
@@ -194,7 +196,7 @@ class DzenPublisher:
             await ctx.close()
 
 
-    # ── Internal ──────────────────────────────────────────────────────────────
+    # ── Internal ──────────────────────────────────────────────────────
 
     async def _make_context(self, cookies: list) -> BrowserContext:
         proxy = None
@@ -523,13 +525,13 @@ class DzenPublisher:
                 f"Найдено {count} полей ввода, ожидалось 2. URL: {page.url}"
             )
 
-        # ── Заголовок ─────────────────────────────────────────────────────────
+        # ── Заголовок ─────────────────────────────────────────────────────
         log.info("Заголовок: %s", title[:60])
         await textboxes.first.click(force=True)
         await self._paste_text(page, title)
         await asyncio.sleep(0.5)
 
-        # ── Активируем поле тела ──────────────────────────────────────────────
+        # ── Активируем поле тела ──────────────────────────────────────────
         await textboxes.nth(1).click(force=True)
         await asyncio.sleep(1)
 
@@ -1247,9 +1249,187 @@ class DzenPublisher:
                 except Exception:
                     pass
 
+    async def _do_publish_reel(
+        self, page: Page, video_url: str, description: str
+    ) -> dict:
+        """Публикация РОЛИКА (вертикальное короткое видео).
+
+        Отличия от обычного видео:
+          - нет отдельного заголовка (описание = «шапка», ≤200 символов);
+          - обложка не нужна (берётся кадр из ролика);
+          - отдельный пункт меню «Ролик» / «Загрузить ролик».
+
+        ВНИМАНИЕ: селекторы пункта меню и поля описания ролика
+        нужно сверить с живым UI Студии (см. DZEN.md). Ниже — набор
+        кандидатов; при смене интерфейса обновить список.
+        """
+        log.info("Переход в Студию для публикации ролика: %s", ENTRY_URL)
+        await page.goto(ENTRY_URL, wait_until="domcontentloaded", timeout=60_000)
+
+        if await _is_login_page(page):
+            raise SessionExpiredError("Сессия истекла — редирект на страницу входа")
+        if await _is_captcha_page(page):
+            raise CaptchaDetectedError("SmartCaptcha обнаружена")
+
+        await self._close_modals(page)
+
+        log.info("Нажимаем кнопку создания публикации...")
+        await page.wait_for_selector(ADD_BUTTON, timeout=15_000)
+        await page.evaluate(
+            "document.querySelector('[data-testid=\"add-publication-button\"]').click()"
+        )
+        await asyncio.sleep(2)
+
+        log.info("Выбираем пункт меню 'Ролик'...")
+        await page.evaluate(
+            """() => {
+                const all = document.querySelectorAll('span, button, li, [role="menuitem"]');
+                for (const el of all) {
+                    const txt = el.innerText ? el.innerText.trim() : "";
+                    if (txt === 'Загрузить ролик' || txt === 'Ролик'
+                        || txt === 'Загрузить видеоролик' || txt === 'Снять ролик'
+                        || txt === 'Добавить ролик') {
+                        el.click();
+                        return;
+                    }
+                }
+            }"""
+        )
+        await page.wait_for_load_state("domcontentloaded")
+        await asyncio.sleep(5)
+
+        # Готовим файл ролика
+        temp_video_path = None
+        if video_url.startswith(("http://", "https://")):
+            temp_video_path = await self._download_to_temp_file(video_url, "reel", extension=".mp4")
+            if not temp_video_path:
+                raise PublishError("Не удалось скачать файл ролика")
+            video_file = temp_video_path
+        else:
+            if not os.path.exists(video_url):
+                raise PublishError(f"Локальный файл ролика не найден на VPS: {video_url}")
+            video_file = video_url
+            log.info("Используем локальный файл ролика на VPS: %s", video_file)
+
+        try:
+            log.info("Ожидаем появления инпута для загрузки ролика...")
+            file_input = None
+            for attempt in range(6):
+                loc = page.locator('input[type="file"]').first
+                if await loc.count() > 0:
+                    file_input = loc
+                    break
+                log.info("Инпут ролика не найден, попытка %d/6, ждём 2с...", attempt + 1)
+                await asyncio.sleep(2)
+
+            if not file_input:
+                raise EditorNotFoundError("Инпут для загрузки файла ролика не найден")
+
+            log.info("Загружаем файл ролика через set_input_files...")
+            await file_input.set_input_files(video_file)
+
+            # Поле описания (заголовка у ролика нет)
+            log.info("Ожидаем форму описания ролика (до 30с)...")
+            desc_input = None
+            for attempt in range(30):
+                for sel in [
+                    '.ql-editor',
+                    '[contenteditable="true"]',
+                    'textarea[placeholder*="писани"]',
+                    'textarea[placeholder*="Добавьте описание"]',
+                    'textarea[placeholder*="Опишите"]',
+                    '[role="textbox"]',
+                ]:
+                    loc = page.locator(sel).first
+                    if await loc.count() > 0 and await loc.is_visible():
+                        desc_input = loc
+                        break
+                if desc_input:
+                    log.info("Форма описания ролика появилась через %dс", attempt)
+                    break
+                await asyncio.sleep(1)
+
+            if desc_input:
+                await desc_input.click(force=True)
+                await page.keyboard.press("Control+a")
+                await page.keyboard.press("Backspace")
+                await self._paste_text(page, description)
+                log.info("Описание ролика введено (%d симв.): %s", len(description), description[:40])
+            else:
+                log.warning("Поле описания ролика не найдено")
+
+            # Ждём завершения загрузки + жмём публикацию
+            log.info("Ожидаем завершения загрузки ролика (до 180с)...")
+            intercepted_urls: list[str] = []
+
+            async def _on_response(response):
+                try:
+                    if response.status == 200 and "application/json" in response.headers.get("content-type", ""):
+                        t = await response.text()
+                        m = re.findall(r"https://dzen\.ru/[abv]/[A-Za-z0-9_-]+", t)
+                        if m:
+                            intercepted_urls.extend(m)
+                except Exception:
+                    pass
+
+            page.on("response", _on_response)
+
+            publish_btn = None
+            for attempt in range(36):
+                for sel in [
+                    '[data-testid="video-publish-btn"]',
+                    '[data-testid="publish-btn"]',
+                    'button:has-text("Опубликовать")',
+                ]:
+                    loc = page.locator(sel).first
+                    if await loc.count() > 0 and await loc.is_visible() and not await loc.is_disabled():
+                        publish_btn = loc
+                        break
+                if publish_btn:
+                    log.info("Ролик загружен, кнопка публикации готова через %dс", attempt * 5)
+                    break
+                await asyncio.sleep(5)
+
+            if not publish_btn:
+                log.info("Пробуем принудительно нажать 'Опубликовать' через JS...")
+                success = await page.evaluate(
+                    """() => {
+                        const b = Array.from(document.querySelectorAll('button'))
+                            .find(x => x.innerText && x.innerText.includes('Опубликовать') && !x.disabled);
+                        if (b) { b.click(); return true; }
+                        return false;
+                    }"""
+                )
+                if not success:
+                    await _screenshot(page, "debug_reel_publish_btn_not_found.png")
+                    raise PublishError("Ролик не загрузился вовремя или кнопка публикации заблокирована")
+            else:
+                await publish_btn.scroll_into_view_if_needed()
+                await publish_btn.click()
+
+            log.info("Кнопка публикации ролика нажата. Ожидаем завершения...")
+            await asyncio.sleep(3)
+            await _handle_vk_captcha(page)
+            await asyncio.sleep(3)
+
+            if await _is_captcha_page(page):
+                await _screenshot(page, "captcha_detected.png")
+                raise CaptchaDetectedError("SmartCaptcha обнаружена при публикации ролика")
+
+            published_url = intercepted_urls[-1] if intercepted_urls else page.url
+            log.info("Ролик успешно опубликован. URL: %s", published_url)
+            return {"success": True, "published_url": published_url}
+
+        finally:
+            if temp_video_path and os.path.exists(temp_video_path):
+                try:
+                    os.remove(temp_video_path)
+                except Exception:
+                    pass
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+
+# ── Helpers ───────────────────────────────────────────────────────────────────────────────
 
 def _err(code: str, message: str, draft_url: Optional[str] = None) -> dict:
     result: dict = {"success": False, "error": code, "message": message}
