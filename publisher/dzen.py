@@ -1542,12 +1542,11 @@ class DzenPublisher:
                     break
                 await asyncio.sleep(5)
 
-            # ВАЖНО: в модалке ролика финальная публикация — это кнопка
-            # «Сохранить изменения» (подтверждено вручную 2026-07-23).
-            # «Опубликовать после обработки» / «Опубликовать» — fallback для
-            # ещё обрабатывающегося видео.
+            # Публикация ролика — кнопка «Опубликовать после обработки» (пока видео
+            # обрабатывается) или «Опубликовать» (когда обработано).
+            # НЕ используем «Сохранить изменения» — она сохраняет правку поверх уже
+            # опубликованного ролика и создаёт статус «Неопубликованные правки».
             publish_labels = [
-                "Сохранить изменения",
                 "Опубликовать после обработки",
                 "Опубликовать",
             ]
@@ -1576,7 +1575,7 @@ class DzenPublisher:
                 log.info("Пробуем нажать кнопку публикации через JS...")
                 clicked_label = await page.evaluate(
                     """() => {
-                        const labels = ['Сохранить изменения', 'Опубликовать после обработки', 'Опубликовать'];
+                        const labels = ['Опубликовать после обработки', 'Опубликовать'];
                         const btns = Array.from(document.querySelectorAll('button'));
                         for (const label of labels) {
                             const b = btns.find(x => x.innerText && x.innerText.trim().includes(label) && !x.disabled);
@@ -1598,24 +1597,6 @@ class DzenPublisher:
             await _handle_vk_captcha(page)
             await asyncio.sleep(3)
 
-            # Финальный коммит: в модалке ролика публикацию закрывает кнопка
-            # «Сохранить изменения» (подтверждено вручную). Дожимаем её, если активна.
-            for _ in range(8):
-                try:
-                    save_btn = page.locator('button:has-text("Сохранить изменения")').first
-                    if (await save_btn.count() > 0 and await save_btn.is_visible()
-                            and not await save_btn.is_disabled()):
-                        await save_btn.scroll_into_view_if_needed()
-                        await save_btn.click()
-                        log.info("Нажата 'Сохранить изменения' (финальный коммит ролика)")
-                        await asyncio.sleep(2)
-                        await _handle_vk_captcha(page)
-                        await asyncio.sleep(2)
-                        break
-                except Exception:
-                    pass
-                await asyncio.sleep(2)
-
             if await _is_captcha_page(page):
                 await _screenshot(page, "captcha_detected.png")
                 raise CaptchaDetectedError("SmartCaptcha обнаружена при публикации ролика")
@@ -1627,15 +1608,32 @@ class DzenPublisher:
             # — читаем из DOM; параллельно держим перехваченные из сети как fallback.
             published_url = None
             for _ in range(20):
+                # 1) Кнопка «Скопировать» рядом с «Ссылка на видео» → читаем полный URL из буфера
+                try:
+                    copied = await page.evaluate(
+                        """() => {
+                            const b = Array.from(document.querySelectorAll('button'))
+                                .find(x => (x.innerText || '').trim() === 'Скопировать');
+                            if (b) { b.click(); return true; }
+                            return false;
+                        }"""
+                    )
+                    if copied:
+                        await asyncio.sleep(0.4)
+                        clip = await page.evaluate(
+                            "async () => { try { return await navigator.clipboard.readText(); } catch(e) { return null; } }"
+                        )
+                        if clip and re.search(r"dzen\.ru/(?:video/watch|shorts)/[A-Za-z0-9_-]+", clip):
+                            published_url = clip.strip()
+                            break
+                except Exception:
+                    pass
+                # 2) Явный <a href> или regex по всему DOM
                 try:
                     href = await page.evaluate(
                         """() => {
-                            // 1) явный <a href> на видео/ролик
-                            const a = document.querySelector(
-                                'a[href*="/video/watch/"], a[href*="/shorts/"]'
-                            );
+                            const a = document.querySelector('a[href*="/video/watch/"], a[href*="/shorts/"]');
                             if (a && a.href) return a.href;
-                            // 2) ищем ссылку в любом атрибуте/тексте DOM (блок «Ссылка на видео»)
                             const html = document.documentElement.outerHTML;
                             const m = html.match(/dzen\\.ru\\/(?:video\\/watch|shorts)\\/[A-Za-z0-9_-]+/);
                             return m ? 'https://' + m[0] : null;
@@ -1646,6 +1644,7 @@ class DzenPublisher:
                 if href:
                     published_url = href
                     break
+                # 3) Перехваченный из сети
                 if intercepted_urls:
                     published_url = intercepted_urls[-1]
                     break
