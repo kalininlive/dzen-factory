@@ -1527,43 +1527,73 @@ class DzenPublisher:
 
             page.on("response", _on_response)
 
-            # Кнопка в модалке ролика называется «Опубликовать после обработки» —
-            # активна уже во время обработки видео, публикация произойдёт сама.
+            # Ждём завершения обработки ролика — публикация доступна только после
+            # «Загрузили и обработали ролик» / «можно публиковать».
+            for _ in range(36):
+                done = await page.evaluate(
+                    """() => {
+                        const t = document.body.innerText || '';
+                        return t.includes('Загрузили и обработали')
+                            || t.includes('можно публиковать');
+                    }"""
+                )
+                if done:
+                    log.info("Ролик обработан — можно публиковать")
+                    break
+                await asyncio.sleep(5)
+
+            # ВАЖНО: в модалке ролика финальная публикация — это кнопка
+            # «Сохранить изменения» (подтверждено вручную 2026-07-23).
+            # «Опубликовать после обработки» / «Опубликовать» — fallback для
+            # ещё обрабатывающегося видео.
+            publish_labels = [
+                "Сохранить изменения",
+                "Опубликовать после обработки",
+                "Опубликовать",
+            ]
             publish_btn = None
-            for attempt in range(36):
-                for sel in [
-                    'button:has-text("Опубликовать после обработки")',
-                    '[data-testid="video-publish-btn"]',
-                    '[data-testid="publish-btn"]',
-                    'button:has-text("Опубликовать")',
-                ]:
-                    loc = page.locator(sel).first
+            clicked_label = None
+            for attempt in range(24):
+                for label in publish_labels:
+                    loc = page.locator(f'button:has-text("{label}")').first
                     if await loc.count() > 0 and await loc.is_visible() and not await loc.is_disabled():
                         publish_btn = loc
+                        clicked_label = label
                         break
+                if not publish_btn:
+                    for sel in ['[data-testid="video-publish-btn"]', '[data-testid="publish-btn"]']:
+                        loc = page.locator(sel).first
+                        if await loc.count() > 0 and await loc.is_visible() and not await loc.is_disabled():
+                            publish_btn = loc
+                            clicked_label = sel
+                            break
                 if publish_btn:
-                    log.info("Ролик загружен, кнопка публикации готова через %dс", attempt * 5)
+                    log.info("Кнопка публикации готова через %dс: '%s'", attempt * 5, clicked_label)
                     break
                 await asyncio.sleep(5)
 
             if not publish_btn:
-                log.info("Пробуем принудительно нажать 'Опубликовать' через JS...")
-                success = await page.evaluate(
+                log.info("Пробуем нажать кнопку публикации через JS...")
+                clicked_label = await page.evaluate(
                     """() => {
-                        const b = Array.from(document.querySelectorAll('button'))
-                            .find(x => x.innerText && x.innerText.includes('Опубликовать') && !x.disabled);
-                        if (b) { b.click(); return true; }
-                        return false;
+                        const labels = ['Сохранить изменения', 'Опубликовать после обработки', 'Опубликовать'];
+                        const btns = Array.from(document.querySelectorAll('button'));
+                        for (const label of labels) {
+                            const b = btns.find(x => x.innerText && x.innerText.trim().includes(label) && !x.disabled);
+                            if (b) { b.click(); return label; }
+                        }
+                        return null;
                     }"""
                 )
-                if not success:
+                if not clicked_label:
                     await _screenshot(page, "debug_reel_publish_btn_not_found.png")
-                    raise PublishError("Ролик не загрузился вовремя или кнопка публикации заблокирована")
+                    raise PublishError("Кнопка публикации ролика не найдена или заблокирована")
+                log.info("Кнопка публикации нажата через JS: '%s'", clicked_label)
             else:
                 await publish_btn.scroll_into_view_if_needed()
                 await publish_btn.click()
 
-            log.info("Кнопка публикации ролика нажата. Ожидаем завершения...")
+            log.info("Кнопка публикации ролика нажата ('%s'). Ожидаем завершения...", clicked_label)
             await asyncio.sleep(3)
             await _handle_vk_captcha(page)
             await asyncio.sleep(3)
