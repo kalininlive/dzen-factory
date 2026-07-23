@@ -1598,6 +1598,24 @@ class DzenPublisher:
             await _handle_vk_captcha(page)
             await asyncio.sleep(3)
 
+            # Финальный коммит: в модалке ролика публикацию закрывает кнопка
+            # «Сохранить изменения» (подтверждено вручную). Дожимаем её, если активна.
+            for _ in range(8):
+                try:
+                    save_btn = page.locator('button:has-text("Сохранить изменения")').first
+                    if (await save_btn.count() > 0 and await save_btn.is_visible()
+                            and not await save_btn.is_disabled()):
+                        await save_btn.scroll_into_view_if_needed()
+                        await save_btn.click()
+                        log.info("Нажата 'Сохранить изменения' (финальный коммит ролика)")
+                        await asyncio.sleep(2)
+                        await _handle_vk_captcha(page)
+                        await asyncio.sleep(2)
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+
             if await _is_captcha_page(page):
                 await _screenshot(page, "captcha_detected.png")
                 raise CaptchaDetectedError("SmartCaptcha обнаружена при публикации ролика")
@@ -1612,11 +1630,15 @@ class DzenPublisher:
                 try:
                     href = await page.evaluate(
                         """() => {
+                            // 1) явный <a href> на видео/ролик
                             const a = document.querySelector(
-                                'a[href*="dzen.ru/video/watch"], a[href*="/video/watch/"], '
-                                + 'a[href*="dzen.ru/shorts/"], a[href*="/shorts/"]'
+                                'a[href*="/video/watch/"], a[href*="/shorts/"]'
                             );
-                            return a ? a.href : null;
+                            if (a && a.href) return a.href;
+                            // 2) ищем ссылку в любом атрибуте/тексте DOM (блок «Ссылка на видео»)
+                            const html = document.documentElement.outerHTML;
+                            const m = html.match(/dzen\\.ru\\/(?:video\\/watch|shorts)\\/[A-Za-z0-9_-]+/);
+                            return m ? 'https://' + m[0] : null;
                         }"""
                     )
                 except Exception:
