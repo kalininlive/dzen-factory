@@ -226,6 +226,14 @@ cat <<EOT > /etc/systemd/system/dzen-publisher.service.d/browsers.conf || err "�
 [Service]
 Environment=PLAYWRIGHT_BROWSERS_PATH=$PROJECT_DIR/browsers
 EOT
+# Защита сервера по памяти: браузер публикатора не должен съесть память соседних сервисов (n8n и т.д.)
+cat <<EOT > /etc/systemd/system/dzen-publisher.service.d/limits.conf || err "Не удалось записать лимиты службы"
+[Service]
+MemoryHigh=1200M
+MemoryMax=2G
+MemorySwapMax=512M
+TasksMax=300
+EOT
 
 log "Перезагрузка конфигурации systemd..."
 systemctl daemon-reload || err "Не удалось выполнить systemctl daemon-reload"
