@@ -95,6 +95,10 @@ log "Установка зависимостей из requirements.txt..."
 pip install -r publisher/requirements.txt || err "Не удалось установить зависимости Python"
 
 step "[5/8] Установка браузера Chromium (Patchright)"
+# Браузер храним в папке проекта, а не в ~/.cache/ms-playwright: чистка кэша на сервере
+# (сентябрь 2026) снесла его, публикация и проверки аккаунтов молча падали, а драйверы копились.
+export PLAYWRIGHT_BROWSERS_PATH="$PROJECT_DIR/browsers"
+mkdir -p "$PLAYWRIGHT_BROWSERS_PATH"
 log "Установка системных зависимостей Chromium через patchright..."
 patchright install-deps chromium || err "Не удалось установить зависимости Chromium"
 log "Установка бинарных файлов Chromium через patchright..."
@@ -214,6 +218,13 @@ EnvironmentFile=$PROJECT_DIR/.env
 
 [Install]
 WantedBy=multi-user.target
+EOT
+
+# Путь к браузеру — drop-in, чтобы переживал ручные правки основного unit-файла
+mkdir -p /etc/systemd/system/dzen-publisher.service.d
+cat <<EOT > /etc/systemd/system/dzen-publisher.service.d/browsers.conf || err "Не удалось записать drop-in службы"
+[Service]
+Environment=PLAYWRIGHT_BROWSERS_PATH=$PROJECT_DIR/browsers
 EOT
 
 log "Перезагрузка конфигурации systemd..."

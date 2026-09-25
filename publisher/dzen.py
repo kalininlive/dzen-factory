@@ -87,22 +87,41 @@ class DzenPublisher:
 
     async def __aenter__(self):
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
+        try:
+            self._browser = await self._playwright.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+        except BaseException:
+            # Если __aenter__ падает, __aexit__ не вызывается — без этого процесс
+            # драйвера (node … run-driver) остаётся висеть навсегда (утечка ~190 МБ на вызов).
+            await self._shutdown()
+            raise
         return self
 
     async def __aexit__(self, *_):
-        if self._browser:
-            await self._browser.close()
-        if self._playwright:
-            await self._playwright.stop()
+        await self._shutdown()
+
+    async def _shutdown(self) -> None:
+        """Закрыть браузер и остановить драйвер при любом исходе (ошибка close() не должна мешать stop())."""
+        browser, self._browser = self._browser, None
+        pw, self._playwright = self._playwright, None
+        try:
+            if browser:
+                await asyncio.wait_for(browser.close(), timeout=30)
+        except Exception as e:
+            log.warning("Не удалось закрыть браузер: %s", e)
+        finally:
+            if pw:
+                try:
+                    await asyncio.wait_for(pw.stop(), timeout=30)
+                except Exception as e:
+                    log.warning("Не удалось остановить драйвер patchright: %s", e)
 
     def _get_cookies_path(self) -> str:
         if self.account_id:
