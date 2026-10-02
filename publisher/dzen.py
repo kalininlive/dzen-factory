@@ -62,6 +62,11 @@ class EditorNotFoundError(Exception):
     pass
 
 
+class ChannelSetupRequiredError(Exception):
+    """Дзен показал окно «Настройка канала» (первая публикация канала): владелец должен один раз
+    вручную принять Пользовательское соглашение в Студии. Посты не принимают его автоматически."""
+
+
 class PublishError(Exception):
     pass
 
@@ -210,10 +215,12 @@ class DzenPublisher:
         except EditorNotFoundError as e:
             await _screenshot(page, "editor_not_found.png")
             return _err("editor_not_found", str(e))
+        except ChannelSetupRequiredError as e:
+            await _screenshot(page, "channel_setup_required.png")
+            return _err("channel_setup_required", str(e), draft_url=_draft_url_of(page.url))
         except Exception as e:
             await _screenshot(page, "publish_error.png")
-            draft_url = page.url if EDITOR_URL_RE.search(page.url) else None
-            return _err("publish_error", str(e), draft_url=draft_url)
+            return _err("publish_error", str(e), draft_url=_draft_url_of(page.url))
         finally:
             await ctx.close()
 
@@ -921,6 +928,12 @@ class DzenPublisher:
             await publish_btn.click()
 
         log.info("Кнопка публикации нажата. Ожидаем редиректа или подтверждения...")
+        await asyncio.sleep(2)
+        if await _has_channel_setup_modal(page):
+            raise ChannelSetupRequiredError(
+                "Дзен показал окно «Настройка канала»: первую публикацию канала нужно один раз "
+                "подтвердить вручную в Студии (принять Пользовательское соглашение). Пост сохранён черновиком."
+            )
 
         # Ждём редирект на URL поста (dzen.ru/b/XXX или dzen.ru/a/XXX)
         POST_URL_RE = re.compile(r"https://dzen\.ru/[abv]/[A-Za-z0-9_-]+")
@@ -1023,6 +1036,15 @@ class DzenPublisher:
                 pass
 
         await _screenshot(page, "debug_post_final.png")
+        if await _has_channel_setup_modal(page):
+            raise ChannelSetupRequiredError(
+                "Дзен показал окно «Настройка канала»: примите Пользовательское соглашение вручную в Студии. "
+                "Пост сохранён черновиком."
+            )
+        if not POST_URL_RE.match(published_url):
+            raise PublishError(
+                f"Пост не опубликован: остались в редакторе, публичная ссылка не получена ({published_url})"
+            )
         log.info("Пост опубликован. URL: %s", published_url)
         return {"success": True, "published_url": published_url}
 
@@ -1747,6 +1769,23 @@ class DzenPublisher:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _draft_url_of(url: str) -> Optional[str]:
+    """URL черновика: редактор статьи (…/id/<ch>/<id>/edit) или поста (…?briefEditorPublicationId=…)."""
+    if EDITOR_URL_RE.search(url) or "briefEditorPublicationId=" in url:
+        return url
+    return None
+
+
+async def _has_channel_setup_modal(page: Page) -> bool:
+    try:
+        return await page.evaluate("""() => {
+            const t = document.body.innerText || '';
+            return t.includes('Настройка канала') && t.includes('Я принимаю условия');
+        }""")
+    except Exception:
+        return False
+
 
 def _err(code: str, message: str, draft_url: Optional[str] = None) -> dict:
     result: dict = {"success": False, "error": code, "message": message}

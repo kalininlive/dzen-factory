@@ -527,6 +527,7 @@ async def _maybe_notify_telegram(error_code: str, message: str, draft_url: Optio
         "captcha_detected": "🤖 SmartCaptcha заблокировала публикацию. Проверьте прокси.",
         "editor_not_found": "⚠️ Редактор Дзена не найден — интерфейс мог измениться. Обновите селекторы в dzen.py.",
         "rate_limited": "🚦 Дневной лимит публикаций достигнут.",
+        "channel_setup_required": "📝 Дзен просит один раз настроить канал: откройте черновик в Студии, нажмите «Опубликовать» и примите Пользовательское соглашение. Публикация сохранена черновиком.",
     }
     text = text_map.get(error_code, f"❌ Ошибка публикации: {error_code}\n{message}")
     if draft_url:
