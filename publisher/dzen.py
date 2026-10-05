@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import tempfile
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import httpx
@@ -23,6 +24,34 @@ from config import (
 )
 
 log = logging.getLogger(__name__)
+
+# Часовой пояс Студии Дзена (GMT+5, Екатеринбург)
+TZ_STUDIO = timezone(timedelta(hours=5))
+
+RU_MONTHS = [
+    "", "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря"
+]
+
+
+def _parse_scheduled_at(val: str) -> datetime:
+    """Парсит дату/время и переводит в часовой пояс Студии Дзена GMT+5."""
+    s = val.strip()
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=TZ_STUDIO)
+        return dt.astimezone(TZ_STUDIO)
+    except Exception:
+        pass
+
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y %H:%M:%S"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.replace(tzinfo=TZ_STUDIO)
+        except Exception:
+            pass
+    raise ValueError(f"Не удалось распознать формат даты/времени: '{val}'. Ожидается 'YYYY-MM-DD HH:MM' или ISO.")
 
 # ── Verified URLs ─────────────────────────────────────────────────────────────
 ENTRY_URL = "https://dzen.ru/profile/editor/create"
@@ -187,6 +216,7 @@ class DzenPublisher:
         video_url: Optional[str] = None,
         cover_url: Optional[str] = None,
         tags: list[str] | None = None,
+        scheduled_at: Optional[str] = None,
     ) -> dict:
         cookies = load_cookies(self._get_cookies_path())
         if not cookies:
@@ -196,7 +226,9 @@ class DzenPublisher:
         page = await ctx.new_page()
         try:
             if content_type == "post":
-                return await self._do_publish_post(page, body or "", image_urls or [])
+                return await self._do_publish_post(
+                    page, body or "", image_urls or [], scheduled_at=scheduled_at
+                )
             elif content_type == "reel":
                 return await self._do_publish_reel(
                     page, video_url or "", body or "", cover_url, tags or []
@@ -206,7 +238,9 @@ class DzenPublisher:
                     page, video_url or "", title or "Без названия", body or "", cover_url, tags or []
                 )
             else:
-                return await self._do_publish(page, title or "Без названия", body or "", image_urls or [])
+                return await self._do_publish(
+                    page, title or "Без названия", body or "", image_urls or [], scheduled_at=scheduled_at
+                )
         except SessionExpiredError as e:
             return _err("session_expired", str(e))
         except CaptchaDetectedError as e:
@@ -319,8 +353,291 @@ class DzenPublisher:
             log.warning("Ошибка при обработке окна настройки канала: %s", str(e))
             return False
 
+    async def _set_schedule_article(self, page: Page, scheduled_dt: datetime) -> bool:
+        """Настраивает отложенную публикацию статьи в боковой панели публикации Дзена."""
+        log.info("Настройка отложенной публикации статьи на %s (GMT+5)...", scheduled_dt.isoformat())
+
+        # 1. Проверяем состояние чекбокса "Опубликовать позже"
+        is_checked = await page.evaluate("""() => {
+            const cb = document.querySelector('input[type="checkbox"].article-editor-desktop--checkbox-v2__input-1y') ||
+                       document.querySelector('label.article-editor-desktop--checkbox-input__rootElement-2A input') ||
+                       Array.from(document.querySelectorAll('label')).find(l => l.innerText && l.innerText.includes('Опубликовать позже'))?.querySelector('input');
+            return cb ? cb.checked : false;
+        }""")
+
+        if not is_checked:
+            log.info("Кликаем чекбокс 'Опубликовать позже'...")
+            clicked = await page.evaluate("""() => {
+                const label = Array.from(document.querySelectorAll('label')).find(l => l.innerText && l.innerText.includes('Опубликовать позже'));
+                if (label) {
+                    label.click();
+                    return true;
+                }
+                const cb = document.querySelector('input[type="checkbox"].article-editor-desktop--checkbox-v2__input-1y');
+                if (cb) {
+                    cb.click();
+                    return true;
+                }
+                return false;
+            }""")
+            if not clicked:
+                cb_loc = page.locator('label:has-text("Опубликовать позже"), input[type="checkbox"].article-editor-desktop--checkbox-v2__input-1y').first
+                if await cb_loc.count() > 0:
+                    await cb_loc.click(force=True)
+            await asyncio.sleep(1)
+
+        # 2. Установка времени (HH:MM)
+        time_str = scheduled_dt.strftime("%H:%M")
+        log.info("Устанавливаем время публикации статьи: %s", time_str)
+        await page.evaluate("""(val) => {
+            const input = document.querySelector('input[name="delayedTime"]') ||
+                          document.querySelector('input.article-editor-desktop--input__control-xw[name="delayedTime"]');
+            if (input) {
+                input.focus();
+                input.value = val;
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                input.blur();
+            }
+        }""", time_str)
+
+        time_loc = page.locator('input[name="delayedTime"]').first
+        if await time_loc.count() > 0:
+            try:
+                await time_loc.fill(time_str)
+            except Exception:
+                pass
+        await asyncio.sleep(0.5)
+
+        # 3. Установка даты (клик по полю даты -> выбор дня в календаре)
+        target_day = scheduled_dt.day
+        log.info("Устанавливаем дату публикации статьи (день %d)...", target_day)
+        await page.evaluate("""() => {
+            const timeInp = document.querySelector('input[name="delayedTime"]');
+            if (timeInp) {
+                const container = timeInp.closest('div[class*="delayed"], form, div[class*="content"]') || timeInp.parentElement?.parentElement;
+                if (container) {
+                    const dateInp = container.querySelector('input[readonly]');
+                    if (dateInp) {
+                        dateInp.click();
+                        return;
+                    }
+                }
+            }
+            const readOnly = document.querySelector('.article-editor-desktop--input__control-xw[readonly]');
+            if (readOnly) {
+                readOnly.click();
+            }
+        }""")
+        await asyncio.sleep(1)
+
+        day_selected = await page.evaluate("""(day) => {
+            const dayElements = Array.from(document.querySelectorAll('[data-testid="datepicker-calendar-day"], .article-editor-desktop--datepicker-day__root-1c, button[class*="day"], div[class*="day"]'));
+            const target = dayElements.find(el => {
+                const txt = el.innerText ? el.innerText.trim() : "";
+                const isCurrentMonth = !el.classList.contains('article-editor-desktop--datepicker-day__outsideMonth-1v') &&
+                                       !el.classList.contains('disabled') &&
+                                       !el.getAttribute('aria-disabled');
+                return txt === String(day) && isCurrentMonth;
+            });
+            if (target) {
+                target.click();
+                return true;
+            }
+            return false;
+        }""", target_day)
+
+        if not day_selected:
+            day_loc = page.locator(f'[data-testid="datepicker-calendar-day"]:text-is("{target_day}")').first
+            if await day_loc.count() > 0 and await day_loc.is_visible():
+                await day_loc.click()
+                day_selected = True
+
+        log.info("Выбор дня %d в календаре статьи: %s", target_day, "успешно" if day_selected else "не найден, используется текущая дата")
+        await asyncio.sleep(1)
+
+        # 4. Нажимаем кнопку "Опубликовать позже"
+        log.info("Ищем финальную кнопку 'Опубликовать позже' для статьи...")
+        side_publish_button = page.locator(SIDE_PUBLISH_BUTTON).first
+        clicked = False
+        try:
+            if await side_publish_button.count() > 0 and await side_publish_button.is_visible():
+                if not await side_publish_button.is_disabled():
+                    await side_publish_button.scroll_into_view_if_needed()
+                    await side_publish_button.click()
+                    clicked = True
+                    log.info("Нажата кнопка SIDE_PUBLISH_BUTTON")
+        except Exception as e:
+            log.warning("Ошибка при клике SIDE_PUBLISH_BUTTON: %s", e)
+
+        if not clicked:
+            clicked = await page.evaluate("""() => {
+                const btns = Array.from(document.querySelectorAll('button'));
+                const target = btns.find(b => b.innerText && (b.innerText.includes('Опубликовать позже') || b.innerText.includes('Опубликовать')) && !b.disabled);
+                if (target) {
+                    target.click();
+                    return true;
+                }
+                return false;
+            }""")
+            if clicked:
+                log.info("Нажата кнопка публикации через JS")
+
+        if not clicked:
+            await _screenshot(page, "debug_schedule_article_btn_failed.png")
+            raise PublishError("Не удалось нажать кнопку 'Опубликовать позже' для статьи")
+
+        await asyncio.sleep(4)
+        await _screenshot(page, "debug_after_schedule_article.png")
+        return True
+
+    async def _set_schedule_post(self, page: Page, scheduled_dt: datetime) -> bool:
+        """Настраивает отложенную публикацию поста в редакторе постов Дзена."""
+        log.info("Настройка отложенной публикации поста на %s (GMT+5)...", scheduled_dt.isoformat())
+
+        # 1. Кнопка настроек публикации (шестерёнка / слайдеры рядом с кнопкой публикации)
+        clicked_settings = False
+        for sel in [
+            '[aria-label="Настройки публикации"]',
+            'button[aria-label="Настройки публикации"]',
+            '.brief-editor--brief-desktop-editor__settingsButton-1X',
+            'button[class*="settingsButton"]',
+        ]:
+            loc = page.locator(sel).first
+            if await loc.count() > 0 and await loc.is_visible():
+                await loc.click()
+                clicked_settings = True
+                break
+
+        if not clicked_settings:
+            clicked_settings = await page.evaluate("""() => {
+                const btns = Array.from(document.querySelectorAll('button'));
+                const target = btns.find(b => (b.getAttribute('aria-label') || '').includes('Настройки'));
+                if (target) {
+                    target.click();
+                    return true;
+                }
+                return false;
+            }""")
+
+        if not clicked_settings:
+            await _screenshot(page, "debug_post_settings_not_found.png")
+            raise PublishError("Не найдена кнопка 'Настройки публикации' в редакторе поста")
+
+        await asyncio.sleep(1)
+
+        # 2. Клик по пункту меню "Время публикации"
+        clicked_time = await page.evaluate("""() => {
+            const items = Array.from(document.querySelectorAll('button, div, span, [role="menuitem"]'));
+            const target = items.find(el => el.innerText && el.innerText.trim() === 'Время публикации');
+            if (target) {
+                target.click();
+                return true;
+            }
+            return false;
+        }""")
+        if not clicked_time:
+            time_loc = page.locator('text="Время публикации"').first
+            if await time_loc.count() > 0 and await time_loc.is_visible():
+                await time_loc.click()
+                clicked_time = True
+
+        if not clicked_time:
+            await _screenshot(page, "debug_post_time_menu_not_found.png")
+            raise PublishError("Пункт меню 'Время публикации' не найден")
+
+        await asyncio.sleep(1)
+
+        # 3. Заполнение даты и времени в модалке Popup2_visible
+        date_str = scheduled_dt.strftime("%d.%m.%Y")
+        time_str = scheduled_dt.strftime("%H:%M")
+        log.info("Вводим дату %s и время %s для поста...", date_str, time_str)
+
+        filled = await page.evaluate("""({d, t}) => {
+            const inputs = Array.from(document.querySelectorAll('.Popup2_visible input.Textinput-Control, [data-testid="popup"] input, div[class*="popup"] input'));
+            if (inputs.length >= 2) {
+                inputs[0].focus();
+                inputs[0].value = d;
+                inputs[0].dispatchEvent(new Event('input', { bubbles: true }));
+                inputs[0].dispatchEvent(new Event('change', { bubbles: true }));
+                inputs[0].blur();
+
+                inputs[1].focus();
+                inputs[1].value = t;
+                inputs[1].dispatchEvent(new Event('input', { bubbles: true }));
+                inputs[1].dispatchEvent(new Event('change', { bubbles: true }));
+                inputs[1].blur();
+                return true;
+            }
+            return false;
+        }""", {"d": date_str, "t": time_str})
+
+        if not filled:
+            log.warning("Не удалось заполнить инпуты времени поста через Popup2_visible, пробуем альтернативный поиск")
+            inputs = page.locator('.Popup2_visible input, [data-testid="popup"] input')
+            if await inputs.count() >= 2:
+                await inputs.nth(0).fill(date_str)
+                await inputs.nth(1).fill(time_str)
+                filled = True
+
+        await asyncio.sleep(1)
+
+        # 4. Нажимаем кнопку "Назад" в попапе времени публикации
+        clicked_back = await page.evaluate("""() => {
+            const btns = Array.from(document.querySelectorAll('.Popup2_visible button, [data-testid="popup"] button, div[class*="popup"] button'));
+            const backBtn = btns.find(b => b.innerText && b.innerText.trim() === 'Назад');
+            if (backBtn) {
+                backBtn.click();
+                return true;
+            }
+            return false;
+        }""")
+        if not clicked_back:
+            await page.keyboard.press("Escape")
+
+        await asyncio.sleep(1)
+
+        # 5. Нажимаем кнопку публикации поста (ее текст меняется на "Опубликовать позже")
+        log.info("Ищем кнопку 'Опубликовать позже' для поста...")
+        publish_btn = None
+        for sel in [
+            '[data-testid="post-publish-btn"]',
+            '.brief-editor--brief-desktop-editor-content__publishButton-1U',
+            'button:has-text("Опубликовать позже")',
+            'button:has-text("Опубликовать")',
+        ]:
+            loc = page.locator(sel).first
+            if await loc.count() > 0 and await loc.is_visible() and not await loc.is_disabled():
+                publish_btn = loc
+                break
+
+        if publish_btn:
+            await publish_btn.scroll_into_view_if_needed()
+            await publish_btn.click()
+            log.info("Кнопка публикации поста нажата")
+        else:
+            success = await page.evaluate("""() => {
+                const btns = Array.from(document.querySelectorAll('button'));
+                const target = btns.find(b => {
+                    const txt = b.innerText ? b.innerText.trim() : "";
+                    return (txt.includes("Опубликовать позже") || txt.includes("Опубликовать")) && !b.disabled;
+                });
+                if (target) {
+                    target.click();
+                    return true;
+                }
+                return false;
+            }""")
+            if not success:
+                await _screenshot(page, "debug_post_schedule_btn_failed.png")
+                raise PublishError("Кнопка 'Опубликовать позже' для поста не найдена или неактивна")
+
+        await asyncio.sleep(4)
+        await _screenshot(page, "debug_after_schedule_post.png")
+        return True
+
     async def _do_publish(
-        self, page: Page, title: str, body: str, image_urls: list[str]
+        self, page: Page, title: str, body: str, image_urls: list[str], scheduled_at: Optional[str] = None
     ) -> dict:
         log.info("Переход в Студию: %s", ENTRY_URL)
         await page.goto(ENTRY_URL, wait_until="domcontentloaded", timeout=60_000)
@@ -440,6 +757,25 @@ class DzenPublisher:
 
         # Шаг 2: капча если появилась, затем финальная кнопка
         await _handle_vk_captcha(page)
+
+        if scheduled_at:
+            scheduled_dt = _parse_scheduled_at(scheduled_at)
+            log.info("Статья будет запланирована на %s (GMT+5)...", scheduled_dt.isoformat())
+            await self._set_schedule_article(page, scheduled_dt)
+            await asyncio.sleep(2)
+            await _handle_vk_captcha(page)
+            if await _is_captcha_page(page):
+                await _screenshot(page, "captcha_detected.png")
+                raise CaptchaDetectedError(
+                    "SmartCaptcha при планировании статьи — настройте мобильный прокси (PROXY_URL в .env)"
+                )
+            log.info("Статья успешно запланирована на %s", scheduled_dt.isoformat())
+            return {
+                "success": True,
+                "status": "scheduled",
+                "scheduled_at": scheduled_dt.isoformat(),
+                "draft_url": page.url,
+            }
 
         try:
             await page.locator(SIDE_PUBLISH_BUTTON).first.wait_for(
@@ -773,7 +1109,7 @@ class DzenPublisher:
             return None
 
     async def _do_publish_post(
-        self, page: Page, text: str, image_urls: list[str]
+        self, page: Page, text: str, image_urls: list[str], scheduled_at: Optional[str] = None
     ) -> dict:
         log.info("Переход в Студию для публикации поста: %s", ENTRY_URL)
         await page.goto(ENTRY_URL, wait_until="domcontentloaded", timeout=60_000)
@@ -874,7 +1210,29 @@ class DzenPublisher:
         await page.keyboard.press("Escape")
         await asyncio.sleep(2)
 
-        # Публикация
+        # Публикация или планирование
+        if scheduled_at:
+            scheduled_dt = _parse_scheduled_at(scheduled_at)
+            log.info("Пост будет запланирован на %s (GMT+5)...", scheduled_dt.isoformat())
+            await self._set_schedule_post(page, scheduled_dt)
+            await asyncio.sleep(2)
+            if await _has_channel_setup_modal(page):
+                raise ChannelSetupRequiredError(
+                    "Дзен показал окно «Настройка канала»: первую публикацию канала нужно один раз "
+                    "подтвердить вручную в Студии (принять Пользовательское соглашение). Пост сохранён черновиком."
+                )
+            await _handle_vk_captcha(page)
+            if await _is_captcha_page(page):
+                await _screenshot(page, "captcha_detected.png")
+                raise CaptchaDetectedError("SmartCaptcha обнаружена при планировании поста")
+            log.info("Пост успешно запланирован на %s", scheduled_dt.isoformat())
+            return {
+                "success": True,
+                "status": "scheduled",
+                "scheduled_at": scheduled_dt.isoformat(),
+                "draft_url": page.url,
+            }
+
         log.info("Ищем кнопку публикации поста...")
         
         intercepted_urls = []

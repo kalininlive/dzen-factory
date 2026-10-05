@@ -217,6 +217,8 @@ class PublishRequest(BaseModel):
 class PublishResponse(BaseModel):
     success: bool
     article_id: str
+    status: Optional[str] = "published"  # "published" | "scheduled" | "draft"
+    scheduled_at: Optional[str] = None
     published_url: Optional[str] = None
     draft_url: Optional[str] = None   # URL черновика в Дзен — страховка при ошибке публикации
     error: Optional[str] = None
@@ -364,6 +366,7 @@ async def publish(req: PublishRequest, _key: str = Security(verify_api_key)):
             video_url=req.video_url,
             cover_url=req.cover_url,
             tags=req.tags,
+            scheduled_at=req.scheduled_at,
         )
 
     if result["success"]:
@@ -373,11 +376,15 @@ async def publish(req: PublishRequest, _key: str = Security(verify_api_key)):
         else:
             _increment_count_memory()
 
-        log.info("Опубликовано [%s]: %s", req.article_id, result.get("published_url"))
+        status = result.get("status", "published")
+        log.info("Опубликовано/запланировано [%s] (статус: %s): %s", req.article_id, status, result.get("published_url") or result.get("scheduled_at"))
         return PublishResponse(
             success=True,
             article_id=req.article_id,
+            status=status,
+            scheduled_at=result.get("scheduled_at") or req.scheduled_at,
             published_url=result.get("published_url"),
+            draft_url=result.get("draft_url"),
             cookies_valid=True,
         )
     else:
